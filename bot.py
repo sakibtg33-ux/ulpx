@@ -43,8 +43,8 @@ CRED_DIR.mkdir(exist_ok=True)
 def timestamp_path(filepath: Path) -> Path:
     return CRED_DIR / f"{filepath.name}.timestamp"
 
-# ========== ডাউনলোড ==========
-async def download_file(url: str):
+# ========== ডাউনলোড (প্রোগ্রেস সহ) ==========
+async def download_file(url: str, progress_callback=None):
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url) as resp:
@@ -61,21 +61,25 @@ async def download_file(url: str):
                     if ts_file.exists():
                         ts_file.unlink()
 
+                    total_size = int(resp.headers.get('content-length', 0))
+                    downloaded = 0
+
                     async with aiofiles.open(filepath, "wb") as f:
-                        while True:
-                            chunk = await resp.content.read(1024 * 1024)
-                            if not chunk:
-                                break
+                        async for chunk in resp.content.iter_chunked(1024*1024):
                             await f.write(chunk)
+                            downloaded += len(chunk)
+                            if progress_callback and total_size > 0:
+                                percent = (downloaded / total_size) * 100
+                                await progress_callback(percent)
 
                     async with aiofiles.open(ts_file, "w") as tf:
                         await tf.write(str(time.time()))
 
-                    return filepath
-                return None
+                    return filepath, total_size
+                return None, 0
     except Exception as e:
         print(f"Download error: {e}")
-        return None
+        return None, 0
 
 # ========== অটো ডিলিট ==========
 async def delete_old_files():
@@ -110,16 +114,25 @@ async def delete_old_files():
     if deleted:
         print(f"Auto-deleted {deleted} files")
 
-# ========== সার্চ (ripgrep) ==========
-def search_credentials(domain: str) -> list:
+# ========== সার্চ (ripgrep) – কোনো লিমিট ছাড়া ==========
+def search_all_credentials(domain: str):
+    """
+    ripgrep দিয়ে সব ম্যাচিং লাইন বের করে (লিমিট নেই)
+    ফলাফল হিসেবে একটি লিস্ট রিটার্ন করে।
+    """
     pattern = rf"@?{re.escape(domain)}"
-    cmd = ["rg", "-i", pattern, str(CRED_DIR), "--no-line-number", "--max-count", "200"]
+    # --max-count না দিলে সব রেজাল্ট আসবে
+    cmd = ["rg", "-i", pattern, str(CRED_DIR), "--no-line-number", "--no-filename"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             lines = result.stdout.strip().split("\n")
+            # ফিল্টার: যেসব লাইনে : আছে এবং অন্তত দুইটি অংশ
             valid = [line for line in lines if ":" in line and len(line.split(":")) >= 2]
-            return valid[:50]
+            return valid
+        return []
+    except subprocess.TimeoutExpired:
+        print("Search timeout after 120 seconds")
         return []
     except Exception as e:
         print(f"Search error: {e}")
@@ -134,15 +147,20 @@ async def addfile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❗ ব্যবহার: /addfile http://example.com/file.txt")
         return
     url = ctx.args[0].strip()
-    await update.message.reply_text(f"📥 ডাউনলোড শুরু: {url}\nবড় ফাইল হলে সময় লাগতে পারে...")
-    path = await download_file(url)
+    msg = await update.message.reply_text(f"📥 ডাউনলোড শুরু: {url}\nপ্রগ্রেস: 0%")
+
+    async def update_progress(percent):
+        await msg.edit_text(f"📥 ডাউনলোড শুরু: {url}\nপ্রগ্রেস: {percent:.1f}%")
+
+    path, total = await download_file(url, update_progress)
     if path:
-        await update.message.reply_text(
-            f"✅ ডাউনলোড সম্পন্ন: `{path.name}`\n📌 {AUTO_DELETE_HOURS} ঘণ্টা পর ডিলিট হবে।",
+        size_mb = total / (1024*1024)
+        await msg.edit_text(
+            f"✅ ডাউনলোড সম্পন্ন: `{path.name}`\n📌 সাইজ: {size_mb:.2f} MB\n📌 {AUTO_DELETE_HOURS} ঘণ্টা পর ডিলিট হবে।",
             parse_mode="Markdown"
         )
     else:
-        await update.message.reply_text("❌ ব্যর্থ। URL চেক করুন।")
+        await msg.edit_text("❌ ব্যর্থ। URL চেক করুন।")
 
 async def listfiles(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
@@ -204,24 +222,50 @@ async def url_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ আপনি এই বট ব্যবহারের অনুমতি পাননি।")
         return
     if not ctx.args:
-        await update.message.reply_text("❗ ব্যবহার: /url example.com")
+        await update.message.reply_text("❗ ব্যবহার: /url example.com\n(সব ফলাফল ফাইল হিসেবে পাঠানো হবে)")
         return
-    domain = ctx.args[0].lower()
-    await update.message.reply_text(f"🔍 `{domain}` খুঁজছি... দয়া করে অপেক্ষা করুন।")
-    results = search_credentials(domain)
-    if not results:
-        await update.message.reply_text("❌ কোনো ক্রেডেনশিয়াল পাওয়া যায়নি।")
-        return
-    msg = f"📄 *{domain}* এর ফলাফল (সর্বোচ্চ ৫০টি):\n\n"
-    for i, cred in enumerate(results, 1):
-        short_cred = cred[:200]
-        msg += f"{i}. `{short_cred}`\n"
-        if len(msg) > 3800:
-            msg += "\n... মেসেজ সীমা অতিক্রম করেছে।"
-            break
-    await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ========== মেইন (সংশোধিত) ==========
+    domain = ctx.args[0].lower()
+    status_msg = await update.message.reply_text(f"🔍 `{domain}` এর জন্য সব রেজাল্ট খুঁজছি... (বড় ফাইলে সময় লাগতে পারে)")
+
+    # সব রেজাল্ট বের করা
+    results = search_all_credentials(domain)
+    if not results:
+        await status_msg.edit_text("❌ কোনো ক্রেডেনশিয়াল পাওয়া যায়নি।")
+        return
+
+    total = len(results)
+    await status_msg.edit_text(f"✅ মোট {total}টি ক্রেডেনশিয়াল পাওয়া গেছে। ফাইল তৈরি করা হচ্ছে...")
+
+    # ফাইল তৈরি
+    timestamp = int(time.time())
+    txt_file_only = CRED_DIR / f"search_{domain}_{timestamp}_only.txt"
+    txt_file_url = CRED_DIR / f"search_{domain}_{timestamp}_url.txt"
+
+    # ব্যাচে লিখতে পারে বড় ফাইলের জন্য (তবে ২০০০০ লাইনে সমস্যা নেই)
+    async with aiofiles.open(txt_file_only, "w") as f:
+        await f.write("\n".join(results))
+    async with aiofiles.open(txt_file_url, "w") as f:
+        await f.write("\n".join(f"{domain}:{cred}" for cred in results))
+
+    # টেলিগ্রামে ফাইল পাঠানো
+    await status_msg.delete()  # পুরনো মেসেজ ডিলিট
+    await update.message.reply_document(
+        document=open(txt_file_only, "rb"),
+        filename=f"{domain}_only.txt",
+        caption=f"📄 {domain} – শুধু login:pass (মোট {total}টি)"
+    )
+    await update.message.reply_document(
+        document=open(txt_file_url, "rb"),
+        filename=f"{domain}_url_login_pass.txt",
+        caption=f"📄 {domain} – url:login:pass (মোট {total}টি)"
+    )
+
+    # লোকাল ফাইল মুছে দেওয়া
+    txt_file_only.unlink()
+    txt_file_url.unlink()
+
+# ========== মেইন ==========
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("addfile", addfile))
@@ -229,17 +273,13 @@ def main():
     app.add_handler(CommandHandler("delfile", delfile))
     app.add_handler(CommandHandler("url", url_cmd))
 
-    # সিডিউলার তৈরি
-    scheduler = AsyncIOScheduler()
-
-    # বট শুরু হওয়ার পর সিডিউলার চালু হবে
     async def post_init(app: Application):
+        scheduler = AsyncIOScheduler()
         scheduler.add_job(delete_old_files, "interval", hours=1)
         scheduler.start()
         print(f"🤖 বট চালু। অটো-ডিলিট প্রতি ঘণ্টায় চেক করবে। ফাইল {AUTO_DELETE_HOURS} ঘণ্টা পরে মুছে যাবে।")
 
     app.post_init = post_init
-
     app.run_polling()
 
 if __name__ == "__main__":
