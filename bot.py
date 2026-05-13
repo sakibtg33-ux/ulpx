@@ -114,29 +114,57 @@ async def delete_old_files():
     if deleted:
         print(f"Auto-deleted {deleted} files")
 
-# ========== সার্চ (ripgrep) – কোনো লিমিট ছাড়া ==========
-def search_all_credentials(domain: str):
+# ========== ক্রেডেনশিয়াল এক্সট্র্যাক্ট (লাইনের শেষের user:pass) ==========
+def extract_user_pass(line: str):
     """
-    ripgrep দিয়ে সব ম্যাচিং লাইন বের করে (লিমিট নেই)
-    ফলাফল হিসেবে একটি লিস্ট রিটার্ন করে।
+    লাইন থেকে শেষের ':' এর ভিত্তিতে user:pass বের করে।
+    যেমন: "anything:user:pass" -> ("user", "pass")
+          "user:pass" -> ("user", "pass")
+    রিটার্ন করে (user, pass) অথবা (None, None)
+    """
+    parts = line.strip().split(":")
+    if len(parts) < 2:
+        return None, None
+    # শেষ অংশটি পাসওয়ার্ড, তার আগের অংশটি ইউজার
+    password = parts[-1]
+    user = parts[-2]
+    return user, password
+
+# ========== সার্চ (সব রেজাল্ট) + ফরম্যাটিং ==========
+def search_and_format(domain: str):
+    """
+    ripgrep দিয়ে সব ম্যাচিং লাইন বের করে।
+    প্রতিটি লাইন থেকে user:pass বের করে দুটি ফরম্যাট তৈরি করে:
+    - only_list: ['user:pass', ...]
+    - url_list: [f'{domain}:user:pass', ...]
     """
     pattern = rf"@?{re.escape(domain)}"
-    # --max-count না দিলে সব রেজাল্ট আসবে
     cmd = ["rg", "-i", pattern, str(CRED_DIR), "--no-line-number", "--no-filename"]
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         if result.returncode == 0:
             lines = result.stdout.strip().split("\n")
-            # ফিল্টার: যেসব লাইনে : আছে এবং অন্তত দুইটি অংশ
-            valid = [line for line in lines if ":" in line and len(line.split(":")) >= 2]
-            return valid
-        return []
+            only_list = []
+            url_list = []
+            for line in lines:
+                if ":" not in line:
+                    continue
+                user, pwd = extract_user_pass(line)
+                if user and pwd:
+                    only_list.append(f"{user}:{pwd}")
+                    url_list.append(f"{domain}:{user}:{pwd}")
+                else:
+                    # যদি extract না হয়, পুরো লাইনটাই ধরে নিচ্ছি (বেকআপ)
+                    only_list.append(line)
+                    url_list.append(f"{domain}:{line}")
+            return only_list, url_list
+        return [], []
     except subprocess.TimeoutExpired:
         print("Search timeout after 120 seconds")
-        return []
+        return [], []
     except Exception as e:
         print(f"Search error: {e}")
-        return []
+        return [], []
 
 # ========== টেলিগ্রাম কমান্ড ==========
 async def addfile(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -222,46 +250,41 @@ async def url_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ আপনি এই বট ব্যবহারের অনুমতি পাননি।")
         return
     if not ctx.args:
-        await update.message.reply_text("❗ ব্যবহার: /url example.com\n(সব ফলাফল ফাইল হিসেবে পাঠানো হবে)")
+        await update.message.reply_text("❗ ব্যবহার: /url example.com\n(সব ফলাফল ফাইল হিসেবে আসবে)")
         return
 
     domain = ctx.args[0].lower()
     status_msg = await update.message.reply_text(f"🔍 `{domain}` এর জন্য সব রেজাল্ট খুঁজছি... (বড় ফাইলে সময় লাগতে পারে)")
 
-    # সব রেজাল্ট বের করা
-    results = search_all_credentials(domain)
-    if not results:
+    only_list, url_list = search_and_format(domain)
+    if not only_list:
         await status_msg.edit_text("❌ কোনো ক্রেডেনশিয়াল পাওয়া যায়নি।")
         return
 
-    total = len(results)
+    total = len(only_list)
     await status_msg.edit_text(f"✅ মোট {total}টি ক্রেডেনশিয়াল পাওয়া গেছে। ফাইল তৈরি করা হচ্ছে...")
 
-    # ফাইল তৈরি
     timestamp = int(time.time())
     txt_file_only = CRED_DIR / f"search_{domain}_{timestamp}_only.txt"
     txt_file_url = CRED_DIR / f"search_{domain}_{timestamp}_url.txt"
 
-    # ব্যাচে লিখতে পারে বড় ফাইলের জন্য (তবে ২০০০০ লাইনে সমস্যা নেই)
     async with aiofiles.open(txt_file_only, "w") as f:
-        await f.write("\n".join(results))
+        await f.write("\n".join(only_list))
     async with aiofiles.open(txt_file_url, "w") as f:
-        await f.write("\n".join(f"{domain}:{cred}" for cred in results))
+        await f.write("\n".join(url_list))
 
-    # টেলিগ্রামে ফাইল পাঠানো
-    await status_msg.delete()  # পুরনো মেসেজ ডিলিট
+    await status_msg.delete()
     await update.message.reply_document(
         document=open(txt_file_only, "rb"),
         filename=f"{domain}_only.txt",
-        caption=f"📄 {domain} – শুধু login:pass (মোট {total}টি)"
+        caption=f"📄 {domain} – শুধু user:pass (মোট {total}টি)"
     )
     await update.message.reply_document(
         document=open(txt_file_url, "rb"),
-        filename=f"{domain}_url_login_pass.txt",
-        caption=f"📄 {domain} – url:login:pass (মোট {total}টি)"
+        filename=f"{domain}_url_user_pass.txt",
+        caption=f"📄 {domain} – {domain}:user:pass (মোট {total}টি)"
     )
 
-    # লোকাল ফাইল মুছে দেওয়া
     txt_file_only.unlink()
     txt_file_url.unlink()
 
