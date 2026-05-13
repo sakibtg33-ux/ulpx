@@ -221,7 +221,7 @@ async def url_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             break
     await update.message.reply_text(msg, parse_mode="Markdown")
 
-# ========== মেইন ==========
+# ========== মেইন (সংশোধিত) ==========
 def main():
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("addfile", addfile))
@@ -229,11 +229,17 @@ def main():
     app.add_handler(CommandHandler("delfile", delfile))
     app.add_handler(CommandHandler("url", url_cmd))
 
+    # সিডিউলার তৈরি
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(delete_old_files, "interval", hours=1)
-    scheduler.start()
 
-    print(f"🤖 বট চালু। অটো-ডিলিট প্রতি ঘণ্টায় চেক করবে। ফাইল {AUTO_DELETE_HOURS} ঘণ্টা পরে মুছে যাবে।")
+    # বট শুরু হওয়ার পর সিডিউলার চালু হবে
+    async def post_init(app: Application):
+        scheduler.add_job(delete_old_files, "interval", hours=1)
+        scheduler.start()
+        print(f"🤖 বট চালু। অটো-ডিলিট প্রতি ঘণ্টায় চেক করবে। ফাইল {AUTO_DELETE_HOURS} ঘণ্টা পরে মুছে যাবে।")
+
+    app.post_init = post_init
+
     app.run_polling()
 
 if __name__ == "__main__":
