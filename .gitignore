@@ -1,0 +1,6 @@
+.env
+cred_files/
+__pycache__/
+*.pyc
+*.log
+*.timestamp
